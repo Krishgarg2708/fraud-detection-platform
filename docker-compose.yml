@@ -1,0 +1,526 @@
+version: "3.9"
+
+networks:
+  fraud-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+  zookeeper-data:
+  zookeeper-log:
+  ml-models:
+  prometheus-data:
+  grafana-data:
+  elasticsearch-data:
+
+services:
+  # ---------------- INFRASTRUCTURE ----------------
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: fraud-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_MULTIPLE_DATABASES: "auth_db,user_db,transaction_db,fraud_db,fraud_case_db,rules_db,risk_db,analytics_db,alert_db,notification_db,audit_db"
+      POSTGRES_USER: fraud_admin
+      POSTGRES_PASSWORD: fraud_secure_pass_2026
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init-multi-db.sh:/docker-entrypoint-initdb.d/init-multi-db.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fraud_admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fraud-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: fraud-redis
+    restart: unless-stopped
+    command: redis-server --requirepass fraud_redis_pass_2026
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "fraud_redis_pass_2026", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fraud-net
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: fraud-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    networks:
+      - fraud-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: fraud-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:29092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - fraud-net
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: fraud-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: fraud-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - fraud-net
+
+  # ---------------- APPLICATION SERVICES ----------------
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    container_name: fraud-auth-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/auth_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PASSWORD: fraud_redis_pass_2026
+      JWT_SECRET: change_this_super_secret_key_min_256_bits_for_hs256_signing_2026
+      JWT_ACCESS_EXPIRY_MS: 900000
+      JWT_REFRESH_EXPIRY_MS: 604800000
+    networks:
+      - fraud-net
+
+  transaction-service:
+    build:
+      context: ./services/transaction-service
+      dockerfile: Dockerfile
+    container_name: fraud-transaction-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/transaction_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PASSWORD: fraud_redis_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  rules-engine-service:
+    build:
+      context: ./services/rules-engine-service
+      dockerfile: Dockerfile
+    container_name: fraud-rules-engine-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/rules_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PASSWORD: fraud_redis_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  risk-scoring-service:
+    build:
+      context: ./services/risk-scoring-service
+      dockerfile: Dockerfile
+    container_name: fraud-risk-scoring-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/risk_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  ml-inference-service:
+    build:
+      context: ./services/ml-inference-service
+      dockerfile: Dockerfile
+    container_name: fraud-ml-inference-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ml-models:/app/models
+    networks:
+      - fraud-net
+
+  alert-service:
+    build:
+      context: ./services/alert-service
+      dockerfile: Dockerfile
+    container_name: fraud-alert-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8085:8085"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/alert_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  notification-service:
+    build:
+      context: ./services/notification-service
+      dockerfile: Dockerfile
+    container_name: fraud-notification-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8086:8086"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/notification_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  user-service:
+    build:
+      context: ./services/user-service
+      dockerfile: Dockerfile
+    container_name: fraud-user-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8087:8087"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/user_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+    networks:
+      - fraud-net
+
+  fraud-detection-service:
+    build:
+      context: ./services/fraud-detection-service
+      dockerfile: Dockerfile
+    container_name: fraud-fraud-detection-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8088:8088"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/fraud_case_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  analytics-service:
+    build:
+      context: ./services/analytics-service
+      dockerfile: Dockerfile
+    container_name: fraud-analytics-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8089:8089"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/analytics_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  audit-service:
+    build:
+      context: ./services/audit-service
+      dockerfile: Dockerfile
+    container_name: fraud-audit-service
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8091:8091"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/audit_db
+      SPRING_DATASOURCE_USERNAME: fraud_admin
+      SPRING_DATASOURCE_PASSWORD: fraud_secure_pass_2026
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - fraud-net
+
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: fraud-api-gateway
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+      transaction-service:
+        condition: service_started
+      rules-engine-service:
+        condition: service_started
+      risk-scoring-service:
+        condition: service_started
+      alert-service:
+        condition: service_started
+      notification-service:
+        condition: service_started
+      user-service:
+        condition: service_started
+      fraud-detection-service:
+        condition: service_started
+      analytics-service:
+        condition: service_started
+      audit-service:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOGSTASH_HOST: logstash
+      SPRING_REDIS_HOST: redis
+      SPRING_REDIS_PASSWORD: fraud_redis_pass_2026
+      JWT_SECRET: ${JWT_SECRET:-change_this_super_secret_key_min_256_bits_for_hs256_signing_2026}
+      GATEWAY_CORS_ALLOWED_ORIGINS: ${GATEWAY_CORS_ALLOWED_ORIGINS:-http://localhost:5173}
+    networks:
+      - fraud-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    container_name: fraud-frontend
+    restart: unless-stopped
+    depends_on:
+      - api-gateway
+    ports:
+      - "5173:80"
+    networks:
+      - fraud-net
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    container_name: fraud-kafka-exporter
+    restart: unless-stopped
+    command: ["--kafka.server=kafka:29092"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "9308:9308"
+    networks:
+      - fraud-net
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: fraud-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./infrastructure/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    ports:
+      - "9090:9090"
+    networks:
+      - fraud-net
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: fraud-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-fraud_admin_2026}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./infrastructure/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards/json:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3001:3000"
+    networks:
+      - fraud-net
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: fraud-elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks:
+      - fraud-net
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.0
+    container_name: fraud-logstash
+    restart: unless-stopped
+    volumes:
+      - ./infrastructure/logging/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./infrastructure/logging/logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+    environment:
+      LS_JAVA_OPTS: "-Xms256m -Xmx256m"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    networks:
+      - fraud-net
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: fraud-kibana
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    networks:
+      - fraud-net
+
+networks:
+  default:
+    driver: bridge
