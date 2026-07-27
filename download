@@ -1,0 +1,17 @@
+target/
+*.class
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/
+node_modules/
+dist/
+build/
+.env
+*.log
+.idea/
+.vscode/
+*.iml
+.DS_Store
+postgres-data/
+redis-data/
+kafka-data/
