@@ -14,7 +14,6 @@ volumes:
   elasticsearch-data:
 
 services:
-  # ---------------- INFRASTRUCTURE ----------------
 
   postgres:
     image: postgres:16-alpine
