@@ -14,7 +14,6 @@ volumes:
   elasticsearch-data:
 
 services:
-
   postgres:
     image: postgres:16-alpine
     container_name: fraud-postgres
